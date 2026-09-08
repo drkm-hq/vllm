@@ -6,6 +6,7 @@ logits, and translating a model into itself must be near-lossless.
 Cross-family runs only check plumbing, since random weights share nothing.
 """
 
+import numpy as np
 import pytest
 import torch
 
@@ -59,9 +60,13 @@ def test_self_translation_is_near_lossless(tiny_qwen3, same_model_examples, mode
         cache = translated_cache(tiny_qwen3, mappers, ex, num_layers, mode=mode)
         kl, _ = continuation_divergence(tiny_qwen3, ex, cache)
         kls.append(kl)
-    # Native projections of an identity-mapped residual are exact; direct
-    # key/value prediction pays for the norms it cannot represent linearly.
-    assert max(kls) < (1e-3 if mode == "resid" else 0.1)
+    # A wrong prefix cache scores ~3e-2 on these models. Native projections
+    # of an identity-mapped residual are exact except for layer-0 rows of
+    # unseen tokens; direct key/value prediction also pays for the norms it
+    # cannot represent linearly.
+    if mode == "resid":
+        assert float(np.median(kls)) < 1e-6
+    assert max(kls) < 5e-3
 
 
 def test_cross_family_study_runs(

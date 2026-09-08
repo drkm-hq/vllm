@@ -34,6 +34,8 @@ def synthetic_corpus(num_lines: int = 400) -> list[str]:
             text = text.capitalize() + "."
         if i % 5 == 0:
             text += " (Émigré café, naïve façade)"
+        if i % 7 == 0:
+            text = "You? So it breaks!\nThe prefix: Prefix.\n" + text
         lines.append(text)
     return lines
 
@@ -43,7 +45,9 @@ def train_bytelevel_bpe(corpus: list[str], vocab_size: int = 600):
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tok.decoder = decoders.ByteLevel()
     trainer = trainers.BpeTrainer(
-        vocab_size=vocab_size, special_tokens=["<bos>", "<eos>"]
+        vocab_size=vocab_size,
+        special_tokens=["<bos>", "<eos>"],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
     tok.train_from_iterator(corpus, trainer)
     tok.post_processor = None
@@ -54,7 +58,9 @@ def train_bytelevel_bpe(corpus: list[str], vocab_size: int = 600):
 
 def train_metaspace_unigram(corpus: list[str], vocab_size: int = 400):
     tok = Tokenizer(models.Unigram())
-    tok.pre_tokenizer = pre_tokenizers.Metaspace()
+    tok.pre_tokenizer = pre_tokenizers.Sequence(
+        [pre_tokenizers.Split("\n", "isolated"), pre_tokenizers.Metaspace()]
+    )
     tok.decoder = decoders.Metaspace()
     trainer = trainers.UnigramTrainer(
         vocab_size=vocab_size, special_tokens=["<s>", "</s>"], unk_token="<unk>"
