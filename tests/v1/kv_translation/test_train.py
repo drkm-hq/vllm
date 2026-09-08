@@ -79,8 +79,9 @@ def test_self_translation_training_recovers_residuals(tiny_qwen3, self_examples)
     report = evaluate_predictor(tiny_qwen3, TranslatorPredictor(translator, "q"), evals)
     after = min(report.r2_hidden.values())
     assert after > before
-    # Measured 0.88 on this fixture; the tiny corpus's vocabulary coverage
-    # bounds held-out R2 even for the exactly linear self-translation.
+    # Measured 0.88 on this fixture. The map is exactly linear (ridge finds
+    # it to R2 ~ 1), but 600 Adam steps on ~30-token examples leave the
+    # network short of the exact solution; the bound guards convergence.
     assert after > 0.75, report.r2_hidden
     assert report.handoff[0].kl_mean < 1e-2
 
@@ -98,18 +99,30 @@ def test_training_is_deterministic(tiny_qwen3, self_examples):
     torch.testing.assert_close(outs[0], outs[1], atol=0, rtol=0)
 
 
-def test_distillation_gradients_reach_translator(tiny_qwen3, self_examples):
+def test_distillation_changes_the_update(tiny_qwen3, self_examples):
+    """The KL term must contribute gradient: the same seeded step with and
+    without it must end in different parameters, and the logged loss must
+    carry the KL."""
     train = self_examples[:8]
-    translator = hub_for(
-        tiny_qwen3, tiny_qwen3, "q", (1, 2), latent_dim=32, context_layers=1
-    )
-    cfg = TrainConfig(steps=2, kl_weight=1.0, kl_every=1, handoff_layer=2)
-    log = train_translator(
-        translator, "q", itertools.cycle(train), cfg, tgt_model=tiny_qwen3
-    )
-    assert "kl" in log[0] and log[0]["kl"] >= 0
-    assert all(torch.isfinite(p).all() for p in translator.parameters())
-    assert all(p.grad is not None for p in translator.parameters())
+    outcomes = {}
+    for weight in (0.0, 1.0):
+        translator = hub_for(
+            tiny_qwen3, tiny_qwen3, "q", (1, 2), latent_dim=32, context_layers=1, seed=3
+        )
+        cfg = TrainConfig(steps=1, kl_weight=weight, kl_every=1, handoff_layer=2)
+        log = train_translator(
+            translator, "q", itertools.cycle(train), cfg, tgt_model=tiny_qwen3
+        )
+        outcomes[weight] = (
+            log[0],
+            [p.detach().clone() for p in translator.parameters()],
+        )
+    plain, distilled = outcomes[0.0], outcomes[1.0]
+    assert "kl" not in plain[0] and distilled[0]["kl"] > 0
+    assert distilled[0]["loss"] > distilled[0]["residual_loss"]
+    assert plain[0]["loss"] == plain[0]["residual_loss"]
+    assert any(not torch.equal(a, b) for a, b in zip(plain[1], distilled[1]))
+    assert all(torch.isfinite(p).all() for p in distilled[1])
     assert not any(p.requires_grad for p in tiny_qwen3.parameters())
 
 

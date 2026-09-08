@@ -163,11 +163,14 @@ template, labels tokens as content or template (tokens straddling a
 boundary count as template), and aligns content per message on
 message-relative offsets; template tokens are never translated.
 
-The study's position policy for non-exact target tokens is the nearest
-source token that has seen at least the target token's text. That token
-has seen up to one token's worth of text beyond the target position, a
-within-token leak that flatters offline numbers slightly. Serving fills
-those positions from the causal context block instead (section 5.3).
+The position policy for non-exact target tokens is causal: the nearest
+source token that has seen no more text than the target token, so no
+translated state depends on bytes the target position has not read. The
+lookahead policy (nearest source token that has seen at least the
+target's text) is available only as an explicitly labelled upper bound.
+Causal alignment under-informs those positions; the contextual
+translator recovers from neighbours, and serving fills them from the
+causal context block (section 5.3).
 
 **Eligibility, fail-closed.** A request falls back to native prefill when
 the tokenizer cannot emit offsets (the Mistral tokenizer reports
@@ -203,6 +206,18 @@ directly.
 | A1 hub | calibrated static input scales, shared latent, per-target-layer low-rank heads (`translator.py`, `context_layers=0`) | residual regression | yes |
 | A2 hub with context | A1 plus one causal attention block over the latent sequence, the size class of a speculative-decoding draft head | residual regression, optional KL distillation through the target | yes |
 | A3 handoff | any of the above below layer L, native recompute from L (`study.py`) | none extra | yes |
+
+The study derives every cache entry, native or translated, by running a
+layer input through the target's own input norm, projections, QK-norm and
+rotary, selecting the rotary the model uses for that layer. That keeps
+sliding-window and local/global rotary semantics the model's own; a
+Gemma-3-shaped fixture with sliding and global layers passes the layer-0
+oracle exactly. The HF study covers attention modules with `k_proj` and
+`v_proj`; MLA and hybrid SSM targets need the vLLM-side fill path and fail
+loudly in the study. Plain-text examples split a document at a target
+token boundary; chat examples render the conversation through each
+model's own template, align content per message and keep template
+positions native, with the final assistant message as the continuation.
 
 Per-token normalization of the source residual was tried and rejected:
 it discards the position's magnitude, which the target residual depends
@@ -249,8 +264,20 @@ features are spoke-independent.
 
 Everything is seeded and deterministic for a fixed example order; the
 test suite checks bitwise reproducibility of training on CPU. On GPU,
-deterministic algorithms must be enabled explicitly, and the einsum and
-attention kernels used by the translator are deterministic under them.
+bit-reproducibility additionally needs `torch.use_deterministic_algorithms`
+and the cuBLAS workspace setting; the causal block uses
+`scaled_dot_product_attention` with `is_causal`, whose flash kernel is
+nondeterministic in backward, so a deterministic run selects the math
+kernel at a speed cost. Inference is a fixed function of its inputs
+either way.
+
+Cost, honestly stated. With the default configuration (six taps,
+latent 2048, rank-512 heads, one context block) the translator for an
+8B target is about 230M parameters, the same class as an EAGLE-3 draft
+head. Training re-runs both frozen models on every step to capture their
+states, which is the same regime as draft-head training that streams
+target features; caching captures to disk trades storage for that
+compute. The distillation stage is the expensive one (section 4.3).
 
 ### 4.4 Onboarding model N+1
 
@@ -453,11 +480,14 @@ residual loss. Run each pair in both directions.
 ## 9. Experiment plan
 
 - **E0, CPU, done.** Oracles on tiny random fixtures: handing off at
-  layer 0 with the true embeddings reproduces native logits; a model
-  translated into itself is near-lossless; template tokens keep native
-  states; training is bitwise reproducible; onboarding with a frozen hub
-  leaves existing targets untouched; the mismatched control is far worse
-  than translation.
+  layer 0 with the true embeddings reproduces native logits on Llama,
+  Qwen3 and Gemma-3 shapes (the last with sliding and global layers);
+  a model translated into itself is near-lossless; template tokens keep
+  native states on chat-rendered examples; the alignment policy never
+  reads ahead; training is bitwise reproducible; onboarding with a
+  frozen hub leaves existing targets untouched; distillation changes the
+  update; the mismatched control is far worse than translation. The
+  suite runs in the CPU-only V1 CI step.
 - **E0-vllm, prerequisite to E1.** Under vLLM with `VLLM_BATCH_INVARIANT`,
   supplying the true layer-L state reproduces native logits exactly for
   every legal L, and does not for an L above the KV-sharing bound.

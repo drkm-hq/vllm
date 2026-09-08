@@ -50,6 +50,15 @@ def test_special_tokens_are_never_aligned(bpe_tokenizer, unigram_tokenizer):
     assert alignment.src_before[0] == -1 and alignment.src_after[0] == -1
 
 
+def test_source_without_content_aligns_nothing():
+    src = TokenSpans(np.array([1]), np.array([[0, 0]]))
+    tgt = TokenSpans(np.array([2, 3]), np.array([[0, 3], [3, 5]]))
+    alignment = align_spans(src, tgt)
+    assert not alignment.exact.any()
+    assert (alignment.src_before == -1).all() and (alignment.src_after == -1).all()
+    assert alignment.boundary_agreement == 0.0
+
+
 def test_rejects_non_monotone_source():
     src = TokenSpans(np.array([1, 2]), np.array([[0, 5], [2, 4]]))
     tgt = TokenSpans(np.array([1]), np.array([[0, 4]]))

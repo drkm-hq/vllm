@@ -107,7 +107,9 @@ def align_spans(src: TokenSpans, tgt: TokenSpans) -> SpanAlignment:
     tgt_ends = tgt.offsets[:, 1]
     if len(src_ends) == 0:
         none: np.ndarray = np.full(len(tgt), -1, dtype=np.int64)
-        return SpanAlignment(none, none.copy(), np.zeros(len(tgt), dtype=bool), tgt_content)
+        return SpanAlignment(
+            none, none.copy(), np.zeros(len(tgt), dtype=bool), tgt_content
+        )
     after = np.searchsorted(src_ends, tgt_ends, side="left")
     before = np.searchsorted(src_ends, tgt_ends, side="right") - 1
     has_after = tgt_content & (after < len(src_ends))

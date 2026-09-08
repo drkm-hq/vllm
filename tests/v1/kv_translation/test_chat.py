@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
+
 import numpy as np
 import pytest
 
@@ -35,7 +37,7 @@ MESSAGES = [
 
 @pytest.fixture(scope="module")
 def header_tokenizer(bpe_tokenizer):
-    tok = bpe_tokenizer
+    tok = copy.deepcopy(bpe_tokenizer)
     tok.add_special_tokens(
         {
             "additional_special_tokens": [
@@ -52,7 +54,7 @@ def header_tokenizer(bpe_tokenizer):
 
 @pytest.fixture(scope="module")
 def chatml_tokenizer(unigram_tokenizer):
-    tok = unigram_tokenizer
+    tok = copy.deepcopy(unigram_tokenizer)
     tok.add_special_tokens(
         {"additional_special_tokens": ["<|im_start|>", "<|im_end|>"]}
     )

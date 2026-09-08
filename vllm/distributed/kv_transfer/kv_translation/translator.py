@@ -60,23 +60,31 @@ class GatedMLP(nn.Module):
 
 
 class CausalBlock(nn.Module):
-    """Pre-norm causal self-attention plus gated MLP over one sequence."""
+    """Pre-norm causal self-attention plus gated MLP over one sequence.
+
+    Uses ``scaled_dot_product_attention`` with ``is_causal`` so no ``[T, T]``
+    mask is materialized and flash kernels apply at long prefixes.
+    """
 
     def __init__(self, dim: int, heads: int, mult: int):
         super().__init__()
+        if dim % heads:
+            raise ValueError(f"latent_dim {dim} not divisible by {heads} heads")
+        self.heads = heads
         self.attn_norm = RMSNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, heads, bias=False, batch_first=True)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.out = nn.Linear(dim, dim, bias=False)
         self.mlp_norm = RMSNorm(dim)
         self.mlp = GatedMLP(dim, mult)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         num_tokens = z.shape[0]
-        mask = torch.triu(
-            torch.ones(num_tokens, num_tokens, dtype=torch.bool, device=z.device), 1
+        q, k, v = (
+            t.view(num_tokens, self.heads, -1).transpose(0, 1)
+            for t in self.qkv(self.attn_norm(z)).chunk(3, dim=-1)
         )
-        h = self.attn_norm(z)[None]
-        attn, _ = self.attn(h, h, h, attn_mask=mask, need_weights=False)
-        z = z + attn[0]
+        attn = F.scaled_dot_product_attention(q, k, v, is_causal=num_tokens > 1)
+        z = z + self.out(attn.transpose(0, 1).reshape(num_tokens, -1))
         return z + self.mlp(self.mlp_norm(z))
 
 
@@ -105,12 +113,12 @@ class LayerHeads(nn.Module):
         self.bias = nn.Parameter(torch.zeros(num_layers, out_dim))
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # Broadcast matmuls read the weights in place; einsum would copy them.
         if self.rank is None:
-            out = torch.einsum("td,ldo->tlo", z, self.weight)
+            out = torch.matmul(z[None], self.weight)
         else:
-            out = torch.einsum(
-                "tlr,lro->tlo", torch.einsum("td,ldr->tlr", z, self.down), self.up
-            )
+            out = torch.matmul(torch.matmul(z[None], self.down), self.up)
+        out = out.transpose(0, 1)
         return out * self.scale[None, :, None] + self.bias[None]
 
     @torch.no_grad()
@@ -180,8 +188,10 @@ class HubTranslator(nn.Module):
         return shared + sum(p.numel() for p in self.heads[target].parameters())
 
     def flops_per_token(self, target: str, context_len: int = 1) -> int:
-        """Approximate multiply-adds per translated position, counting the
-        attention block against ``context_len`` positions."""
+        """Approximate FLOPs per translated position for the translator
+        alone, counting the attention block against ``context_len``
+        positions. The target's own projections in the fill, and any native
+        top layers, are costed separately by the study."""
         dense = 2 * self.num_parameters(target)
         attn = 4 * self.config.latent_dim * context_len * len(self.context)
         return dense + attn
@@ -191,7 +201,7 @@ class HubTranslator(nn.Module):
 
     @classmethod
     def load(cls, path: str) -> "HubTranslator":
-        blob = torch.load(path, map_location="cpu", weights_only=False)
+        blob = torch.load(path, map_location="cpu", weights_only=True)
         cfg = blob["config"]
         cfg["src_layers"] = tuple(cfg["src_layers"])
         cfg["targets"] = {k: tuple(v) for k, v in cfg["targets"].items()}

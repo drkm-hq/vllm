@@ -70,6 +70,7 @@ def test_self_translation_is_near_lossless(tiny_qwen3, same_model_examples, mode
     # for layer-0 rows of unseen tokens; direct key/value prediction also
     # pays for the norms it cannot represent linearly. Both must sit far
     # below what a wrong prefix cache costs.
+    assert baseline, "no example had a longer partner for the wrong cache"
     if mode == "resid":
         assert float(np.median(kls)) < 1e-6
     assert max(kls) < 0.5 * float(np.median(baseline))

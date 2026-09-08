@@ -17,6 +17,7 @@ Runs with HF models only; it is a measurement tool, not the serving path.
 """
 
 import argparse
+import inspect
 import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
@@ -27,6 +28,10 @@ import torch
 import torch.nn.functional as F
 from transformers import DynamicCache
 
+from vllm.distributed.kv_transfer.kv_translation.capture import (
+    decoder,
+    text_config,
+)
 from vllm.distributed.kv_transfer.kv_translation.data import (
     AlignedExample,
     features,
@@ -121,18 +126,29 @@ def heldout_r2(
 
 @torch.no_grad()
 def predictor_hidden_r2(
-    predictor: ResidualPredictor, examples: Sequence[AlignedExample]
+    predictor: ResidualPredictor,
+    examples: Sequence[AlignedExample],
+    exact_only: bool = True,
 ) -> dict[int, float]:
-    """Held-out R2 of the predicted residual at exactly aligned positions."""
+    """Held-out R2 of the predicted residual per target layer, at exactly
+    aligned content positions or, with ``exact_only`` off, at the inexact
+    ones the position policy has to stand in for."""
     num_layers = examples[0].num_target_layers
     out = {}
     for layer in range(num_layers):
         preds, targets = [], []
         for ex in examples:
-            exact_in_content = torch.as_tensor(ex.exact[ex.content])
-            preds.append(predictor.predict_hidden(ex, layer)[exact_in_content])
-            targets.append(ex.exact_states("hidden", layer))
-        out[layer] = r2_score(torch.cat(targets), torch.cat(preds))
+            content = torch.as_tensor(ex.content)
+            select = torch.as_tensor(ex.exact[ex.content])
+            if not exact_only:
+                select = ~select
+            if not select.any():
+                continue
+            preds.append(predictor.predict_hidden(ex, layer)[select])
+            targets.append(ex.tgt_states.residual[layer][content][select])
+        out[layer] = (
+            r2_score(torch.cat(targets), torch.cat(preds)) if preds else float("nan")
+        )
     return out
 
 
@@ -141,52 +157,87 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _apply_target_rope(model, keys: torch.Tensor) -> torch.Tensor:
-    """Rotate ``keys`` ``[1, H, T, D]`` with the model's own rotary module."""
+def _apply_target_rope(model, layer: int, keys: torch.Tensor) -> torch.Tensor:
+    """Rotate ``keys`` ``[1, H, T, D]`` with the rotary module the model uses
+    for ``layer`` (local or global on sliding-window models), over the
+    rotary dims only; the rest pass through as in partial-rotary models."""
+    stack = decoder(model)
+    rotary = stack.rotary_emb
+    kwargs = {}
+    layer_types = getattr(text_config(model), "layer_types", None)
+    if layer_types is not None:
+        if "layer_type" in inspect.signature(rotary.forward).parameters:
+            kwargs["layer_type"] = layer_types[layer]
+        elif layer_types[layer] == "sliding_attention":
+            rotary = getattr(stack, "rotary_emb_local", rotary)
     num_tokens = keys.shape[2]
     positions = torch.arange(num_tokens, device=keys.device)[None]
-    cos, sin = model.model.rotary_emb(keys, positions)
-    cos, sin = cos[:, None], sin[:, None]
-    return keys * cos + _rotate_half(keys) * sin
+    cos, sin = rotary(keys, positions, **kwargs)
+    cos, sin = cos[:, None].to(keys.dtype), sin[:, None].to(keys.dtype)
+    rotary_dim = cos.shape[-1]
+    rot, rest = keys[..., :rotary_dim], keys[..., rotary_dim:]
+    return torch.cat((rot * cos + _rotate_half(rot) * sin, rest), dim=-1)
 
 
-def translated_layer_kv(
-    model, predictor: ResidualPredictor, ex: AlignedExample, layer: int, mode: str
+def layer_kv_from_residual(
+    model, layer: int, hidden: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Predicted post-RoPE keys and values ``[1, H, T, D]`` for content
-    positions of layer ``layer``; non-content rows are zero.
+    """Post-RoPE keys and values ``[1, H, T, D]`` that the target itself
+    computes from a layer input ``hidden`` ``[T, d]``: its own input norm,
+    projections, QK-norm and rotary. Differentiable in ``hidden``."""
+    block = decoder(model).layers[layer]
+    attn = block.self_attn
+    num_kv_heads = text_config(model).num_key_value_heads
+    num_tokens = hidden.shape[0]
+    h = block.input_layernorm(hidden.to(attn.k_proj.weight.dtype))
+    k = attn.k_proj(h).view(num_tokens, num_kv_heads, -1)
+    k_norm = getattr(attn, "k_norm", None)
+    if k_norm is not None:
+        k = k_norm(k)
+    v = attn.v_proj(h).view(num_tokens, num_kv_heads, -1)
+    k, v = k[None].transpose(1, 2), v[None].transpose(1, 2)
+    return _apply_target_rope(model, layer, k), v
 
-    ``resid`` pushes the predicted residual through the target's own
-    projections and QK-norm; ``kv`` needs a predictor with ``predict_kv``.
-    """
-    num_tokens = len(ex.tgt)
-    content = np.flatnonzero(ex.content)
-    attn = model.model.layers[layer].self_attn
-    num_kv_heads = model.config.num_key_value_heads
-    if mode == "resid":
-        h = model.model.layers[layer].input_layernorm(
-            predictor.predict_hidden(ex, layer)
+
+def capture_layer_inputs(
+    model,
+    prefix_ids: torch.Tensor,
+    handoff_layer: int,
+    predicted_hidden: torch.Tensor | None,
+) -> list[torch.Tensor]:
+    """Run the prefix natively, substituting ``predicted_hidden`` as the input
+    of ``handoff_layer`` if given, and return every layer's input ``[T, d]``
+    as computed in that run. Layers below the handoff see native inputs;
+    layers from it on see what follows from the prediction."""
+    num_layers = text_config(model).num_hidden_layers
+    inputs: list[torch.Tensor | None] = [None] * num_layers
+    handles = []
+    if predicted_hidden is not None:
+
+        def swap_input(module, args, kwargs, h=predicted_hidden):
+            return (h[None].to(args[0].dtype),) + tuple(args[1:]), kwargs
+
+        handles.append(
+            decoder(model)
+            .layers[handoff_layer]
+            .register_forward_pre_hook(swap_input, with_kwargs=True)
         )
-        k = attn.k_proj(h).view(len(content), num_kv_heads, -1)
-        k_norm = getattr(attn, "k_norm", None)
-        k = (k_norm(k) if k_norm is not None else k).flatten(1)
-        v = attn.v_proj(h)
-    elif mode == "kv":
-        predict_kv = getattr(predictor, "predict_kv", None)
-        if predict_kv is None:
-            raise ValueError("mode 'kv' needs a predictor with predict_kv")
-        k, v = predict_kv(ex, layer)
-    else:
-        raise ValueError(f"unknown mode {mode!r}")
-    full_k = torch.zeros(num_tokens, k.shape[1], dtype=k.dtype)
-    full_v = torch.zeros(num_tokens, v.shape[1], dtype=v.dtype)
-    full_k[content] = k
-    full_v[content] = v
 
-    def to_cache(t: torch.Tensor) -> torch.Tensor:
-        return t.view(1, num_tokens, num_kv_heads, -1).transpose(1, 2)
+    def capture(index):
+        def _hook(module, args):
+            inputs[index] = args[0][0]
 
-    return _apply_target_rope(model, to_cache(full_k)), to_cache(full_v)
+        return _hook
+
+    for index, block in enumerate(decoder(model).layers):
+        handles.append(block.register_forward_pre_hook(capture(index)))
+    try:
+        model(input_ids=prefix_ids, use_cache=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert all(h is not None for h in inputs)
+    return inputs  # type: ignore[return-value]
 
 
 def translated_cache(
@@ -200,56 +251,76 @@ def translated_cache(
     """Cache for the prefix: layers below ``handoff_layer`` translated,
     layers from it on recomputed natively from the residual at the handoff.
 
-    Special tokens (no source counterpart) keep native states in every
-    layer. ``predicted_hidden`` overrides the predictor at the handoff
-    layer, which makes the exact residual an oracle for the mechanics.
-    Gradients flow through the translated entries when the caller
-    enables them; the frozen target's own prefill runs without.
+    Every entry is produced by the target's own projections from a layer
+    input, so sliding-window and per-layer rotary semantics are the
+    model's own. Positions without a source counterpart (special and
+    template tokens) keep native inputs in every layer. ``predicted_hidden``
+    overrides the predictor at the handoff layer, which makes the exact
+    residual an oracle for the mechanics. ``mode`` ``kv`` writes a
+    predictor's direct key/value predictions at content positions instead.
+    Gradients flow through the predicted entries when the caller enables
+    them; the target's own prefill runs without.
     """
-    num_layers = model.config.num_hidden_layers
-    content = ex.content
-    prefix_ids = torch.as_tensor(ex.tgt.ids)[None]
-    handles = []
-    if handoff_layer < num_layers:
-        if predicted_hidden is None:
-            predicted_hidden = ex.tgt_states.residual[handoff_layer].clone()
-            predicted_hidden[torch.as_tensor(content)] = predictor.predict_hidden(
-                ex, handoff_layer
-            )
-
-        def swap_input(module, args, kwargs, h=predicted_hidden):
-            return (h[None].to(args[0].dtype),) + tuple(args[1:]), kwargs
-
-        handles.append(
-            model.model.layers[handoff_layer].register_forward_pre_hook(
-                swap_input, with_kwargs=True
-            )
+    num_layers = text_config(model).num_hidden_layers
+    content = torch.as_tensor(ex.content)
+    device = next(model.parameters()).device
+    prefix_ids = torch.as_tensor(ex.tgt.ids)[None].to(device)
+    if handoff_layer < num_layers and predicted_hidden is None:
+        predicted_hidden = ex.tgt_states.residual[handoff_layer].clone()
+        predicted_hidden[content] = predictor.predict_hidden(ex, handoff_layer).to(
+            predicted_hidden.dtype
         )
-    try:
-        native = model(input_ids=prefix_ids, use_cache=True).past_key_values
-    finally:
-        for handle in handles:
-            handle.remove()
+    with torch.no_grad():
+        inputs = capture_layer_inputs(
+            model,
+            prefix_ids,
+            handoff_layer,
+            predicted_hidden if handoff_layer < num_layers else None,
+        )
+    if mode not in ("resid", "kv"):
+        raise ValueError(f"unknown mode {mode!r}")
 
-    keep_native = torch.as_tensor(~content)
     cache = DynamicCache(config=model.config)
     for layer in range(num_layers):
-        k, v = native.layers[layer].keys, native.layers[layer].values
-        if layer < handoff_layer:
-            k_hat, v_hat = translated_layer_kv(model, predictor, ex, layer, mode)
-            k_hat[:, :, keep_native] = k[:, :, keep_native]
-            v_hat[:, :, keep_native] = v[:, :, keep_native]
-            k, v = k_hat.to(k.dtype), v_hat.to(v.dtype)
+        hidden = inputs[layer]
+        if layer < handoff_layer and mode == "resid":
+            hidden = hidden.clone()
+            hidden[content] = predictor.predict_hidden(ex, layer).to(hidden.dtype)
+        k, v = layer_kv_from_residual(model, layer, hidden)
+        if layer < handoff_layer and mode == "kv":
+            predict_kv = getattr(predictor, "predict_kv", None)
+            if predict_kv is None:
+                raise ValueError("mode 'kv' needs a predictor with predict_kv")
+            k_hat, v_hat = predict_kv(ex, layer)
+            num_kv_heads = text_config(model).num_key_value_heads
+            k_hat = k_hat.view(1, -1, num_kv_heads, k.shape[-1]).transpose(1, 2)
+            v_hat = v_hat.view(1, -1, num_kv_heads, v.shape[-1]).transpose(1, 2)
+            k, v = k.clone(), v.clone()
+            k[:, :, content] = _apply_target_rope(
+                model, layer, _scatter_positions(k_hat, content, k.shape)
+            )[:, :, content].to(k.dtype)
+            v[:, :, content] = v_hat.to(v.dtype)
         cache.update(k, v, layer)
     return cache
+
+
+def _scatter_positions(
+    values: torch.Tensor, content: torch.Tensor, shape: torch.Size
+) -> torch.Tensor:
+    """Place ``[1, H, C, D]`` rows at the content positions of a zero
+    ``[1, H, T, D]`` tensor so position-dependent rotary applies correctly."""
+    full = torch.zeros(shape, dtype=values.dtype, device=values.device)
+    full[:, :, content] = values
+    return full
 
 
 def continuation_logits(
     model, ex: AlignedExample, cache: DynamicCache
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Native and translated next-token logits over the continuation."""
-    prefix = torch.as_tensor(ex.tgt.ids)[None]
-    cont = ex.cont_ids[None]
+    device = next(model.parameters()).device
+    prefix = torch.as_tensor(ex.tgt.ids)[None].to(device)
+    cont = ex.cont_ids[None].to(device)
     with torch.no_grad():
         full = model(input_ids=torch.cat([prefix, cont], dim=1)).logits
     ref = full[0, prefix.shape[1] :]
@@ -307,8 +378,15 @@ class HandoffResult:
 
 @dataclass
 class StudyReport:
+    """``native_position_fraction`` is the share of prefix positions with
+    no source counterpart (special and template tokens), which every
+    layer keeps native; it is an oracle share, reported next to the
+    layer-wise one."""
+
     boundary_agreement: float
+    native_position_fraction: float
     r2_hidden: dict[int, float]
+    r2_hidden_inexact: dict[int, float] = field(default_factory=dict)
     handoff: list[HandoffResult] = field(default_factory=list)
     src_layers: dict[int, tuple[int, ...]] | None = None
     r2_keys: dict[int, float] | None = None
@@ -362,14 +440,20 @@ def evaluate_predictor(
 ) -> StudyReport:
     """Score a predictor on held-out examples."""
     agreement = float(np.mean([ex.exact[ex.tgt.is_content].mean() for ex in evals]))
-    report = StudyReport(agreement, predictor_hidden_r2(predictor, evals))
+    native_fraction = float(np.mean([(~ex.content).mean() for ex in evals]))
+    report = StudyReport(
+        agreement,
+        native_fraction,
+        predictor_hidden_r2(predictor, evals),
+        predictor_hidden_r2(predictor, evals, exact_only=False),
+    )
     if capacity_ranks:
         report.r2_bound_by_rank = capacity_bound(evals, capacity_ranks)
     if isinstance(predictor, PairMappers):
         r2 = heldout_r2(predictor, evals)
         report.src_layers = predictor.src_layers
         report.r2_keys, report.r2_values = r2["keys"], r2["values"]
-    num_layers = tgt_model.config.num_hidden_layers
+    num_layers = text_config(tgt_model).num_hidden_layers
     for layer in handoff_layers if handoff_layers is not None else [num_layers]:
         rows = []
         for i, ex in enumerate(evals):

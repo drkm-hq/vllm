@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from vllm.distributed.kv_transfer.kv_translation.capture import text_config
 from vllm.distributed.kv_transfer.kv_translation.data import (
     AlignedExample,
     prepare_example,
@@ -102,6 +103,7 @@ def train_translator(
     torch.manual_seed(cfg.seed)
     if tgt_model is not None:
         freeze(tgt_model)
+        tgt_model.eval()
     stream: Iterator[AlignedExample] = iter(examples)
     params = (
         list(translator.parameters())
@@ -144,6 +146,13 @@ def train_translator(
         log.append(entry)
     translator.eval()
     return log
+
+
+def default_source_layers(src_model, count: int = 6) -> tuple[int, ...]:
+    """Evenly spaced layer inputs, excluding the post-norm final state."""
+    num_layers = text_config(src_model).num_hidden_layers
+    picks = torch.linspace(1, num_layers - 1, count).round().int().tolist()
+    return tuple(sorted(set(picks)))
 
 
 def example_stream(
@@ -196,17 +205,15 @@ def main() -> None:
     n_eval = max(1, int(len(texts) * args.eval_frac))
     eval_texts, train_texts = texts[:n_eval], texts[n_eval:]
 
-    num_src = src_model.config.num_hidden_layers
-    src_layers = tuple(
-        args.src_layers or torch.linspace(1, num_src, 6).round().int().tolist()
-    )
+    src_layers = tuple(args.src_layers or default_source_layers(src_model))
     tgt_layers, tgt_dim = (
-        tgt_model.config.num_hidden_layers,
-        tgt_model.config.hidden_size,
+        text_config(tgt_model).num_hidden_layers,
+        text_config(tgt_model).hidden_size,
     )
+    torch.manual_seed(args.seed)
     config = HubConfig(
         src_layers=src_layers,
-        src_dim=src_model.config.hidden_size,
+        src_dim=text_config(src_model).hidden_size,
         latent_dim=args.latent_dim,
         targets={args.tgt: (tgt_layers, tgt_dim)},
         head_rank=args.head_rank,
@@ -220,7 +227,12 @@ def main() -> None:
     evals = [
         ex for ex in (prepare_example(*models, t) for t in eval_texts) if ex is not None
     ]
-    calibrate(translator, args.tgt, evals)
+    calibration = [
+        ex
+        for ex in (prepare_example(*models, t) for t in train_texts[: len(evals)])
+        if ex is not None
+    ]
+    calibrate(translator, args.tgt, calibration)
     cfg = TrainConfig(
         steps=args.steps,
         lr=args.lr,

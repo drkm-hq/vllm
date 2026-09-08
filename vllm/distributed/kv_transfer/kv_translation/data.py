@@ -17,6 +17,10 @@ from vllm.distributed.kv_transfer.kv_translation.capture import (
     CapturedStates,
     capture_states,
 )
+from vllm.distributed.kv_transfer.kv_translation.chat import (
+    align_chats,
+    render_chat,
+)
 
 StateKind = Literal["src", "hidden", "keys", "values"]
 
@@ -74,9 +78,17 @@ class AlignedExample:
         return torch.stack([h[pos] for h in layers], dim=1)
 
 
-def source_position_policy(alignment) -> np.ndarray:
-    """Exact match if any, else the nearest source state that has seen at
-    least the target token's text, else the nearest one before it."""
+def source_position_policy(alignment, allow_lookahead: bool = False) -> np.ndarray:
+    """Which source state stands in for each target position.
+
+    Causal by default: the nearest source token that has seen no more text
+    than the target token, so the translated state never depends on bytes
+    the target position has not read. ``allow_lookahead`` instead takes
+    the nearest source token that has seen at least the target's text,
+    which leaks up to one token of future text and is only an upper bound.
+    """
+    if not allow_lookahead:
+        return alignment.src_before.copy()
     pos = np.where(alignment.exact, alignment.src_before, alignment.src_after)
     return np.where(pos >= 0, pos, alignment.src_before)
 
@@ -88,7 +100,9 @@ def prepare_example(
     tgt_tokenizer,
     text: str,
     prefix_frac: float = 0.75,
+    allow_lookahead: bool = False,
 ) -> AlignedExample | None:
+    """Split ``text`` at a target-token boundary and align the prefix."""
     tgt_full = TokenSpans.from_tokenizer(tgt_tokenizer, text)
     n_prefix = int(len(tgt_full) * prefix_frac)
     if n_prefix < 2 or n_prefix >= len(tgt_full):
@@ -96,15 +110,62 @@ def prepare_example(
     prefix_text = text[: tgt_full.offsets[n_prefix - 1, 1]]
     tgt = TokenSpans(tgt_full.ids[:n_prefix], tgt_full.offsets[:n_prefix])
     src = TokenSpans.from_tokenizer(src_tokenizer, prefix_text)
-    alignment = align_spans(src, tgt)
+    return _build_example(
+        src_model,
+        tgt_model,
+        src,
+        tgt,
+        align_spans(src, tgt),
+        torch.as_tensor(tgt_full.ids[n_prefix:]),
+        allow_lookahead,
+    )
+
+
+def prepare_chat_example(
+    src_model,
+    src_tokenizer,
+    tgt_model,
+    tgt_tokenizer,
+    messages: list[dict],
+    allow_lookahead: bool = False,
+) -> AlignedExample | None:
+    """Render ``messages[:-1]`` through each model's own chat template as
+    the prefix and use the final assistant message as the continuation.
+    Template tokens have no source counterpart and keep native states."""
+    if len(messages) < 2 or messages[-1]["role"] != "assistant":
+        return None
+    src_chat = render_chat(src_tokenizer, messages[:-1])
+    tgt_chat = render_chat(tgt_tokenizer, messages[:-1])
+    alignment = align_chats(src_chat, tgt_chat)
+    if not alignment.exact.any():
+        return None
+    cont_ids = tgt_tokenizer(messages[-1]["content"], add_special_tokens=False)[
+        "input_ids"
+    ]
+    if not cont_ids:
+        return None
+    return _build_example(
+        src_model,
+        tgt_model,
+        src_chat.spans,
+        tgt_chat.spans,
+        alignment,
+        torch.as_tensor(cont_ids),
+        allow_lookahead,
+    )
+
+
+def _build_example(
+    src_model, tgt_model, src, tgt, alignment, cont_ids, allow_lookahead
+):
     return AlignedExample(
         src=src,
         tgt=tgt,
         src_states=capture_states(src_model, torch.as_tensor(src.ids)),
         tgt_states=capture_states(tgt_model, torch.as_tensor(tgt.ids)),
-        src_pos=source_position_policy(alignment),
+        src_pos=source_position_policy(alignment, allow_lookahead),
         exact=alignment.exact,
-        cont_ids=torch.as_tensor(tgt_full.ids[n_prefix:]),
+        cont_ids=cont_ids,
     )
 
 
