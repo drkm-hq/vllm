@@ -268,6 +268,18 @@ def divergence(
 
 
 @torch.no_grad()
+def acceptance_metrics(ref: torch.Tensor, got: torch.Tensor) -> tuple[float, int]:
+    """Speculative acceptance rate ``E[sum_v min(p, q)]`` of the translated
+    distribution as a draft for the native one, and the greedy run length:
+    leading continuation positions whose argmax agrees with native."""
+    p, q = F.softmax(ref.float(), -1), F.softmax(got.float(), -1)
+    alpha = torch.minimum(p, q).sum(-1).mean()
+    agree = ref.argmax(-1) == got.argmax(-1)
+    run = int(agree.shape[0]) if bool(agree.all()) else int((~agree).int().argmax())
+    return float(alpha), run
+
+
+@torch.no_grad()
 def continuation_divergence(
     model, ex: AlignedExample, cache: DynamicCache
 ) -> tuple[float, float]:
@@ -277,10 +289,20 @@ def continuation_divergence(
 
 @dataclass
 class HandoffResult:
+    """Scores for one handoff layer.
+
+    ``kl_control_mean`` is the same measurement with the cache translated
+    from a *different* document's source states: if it is not far worse
+    than ``kl_mean``, nothing about the context is being transferred.
+    """
+
     handoff_layer: int
     native_layer_fraction: float
     kl_mean: float
     top1_agreement: float
+    acceptance_rate: float
+    greedy_run_length_mean: float
+    kl_control_mean: float
 
 
 @dataclass
@@ -291,6 +313,42 @@ class StudyReport:
     src_layers: dict[int, tuple[int, ...]] | None = None
     r2_keys: dict[int, float] | None = None
     r2_values: dict[int, float] | None = None
+    r2_bound_by_rank: dict[int, dict[int, float]] | None = None
+
+
+def mismatched_control(ex: AlignedExample, other: AlignedExample) -> AlignedExample:
+    """``ex`` with its source states replaced by another document's, so the
+    translator sees a real but unrelated context at every position."""
+    src_pos = np.minimum(ex.src_pos, len(other.src) - 1)
+    src_pos = np.where(ex.src_pos >= 0, src_pos, -1)
+    return AlignedExample(
+        src=other.src,
+        tgt=ex.tgt,
+        src_states=other.src_states,
+        tgt_states=ex.tgt_states,
+        src_pos=src_pos,
+        exact=ex.exact,
+        cont_ids=ex.cont_ids,
+    )
+
+
+@torch.no_grad()
+def capacity_bound(
+    examples: Sequence[AlignedExample], ranks: Sequence[int]
+) -> dict[int, dict[int, float]]:
+    """R2 ceiling of a rank-``r`` affine head per target layer: the fraction
+    of the layer's residual variance in its top ``r`` principal directions.
+    Decides whether a head rank can work before any training spend."""
+    out: dict[int, dict[int, float]] = {}
+    for layer in range(examples[0].num_target_layers):
+        h = stack_exact(examples, "hidden", layer).double()
+        h = h - h.mean(0, keepdim=True)
+        eig = torch.linalg.eigvalsh(h.T @ h).flip(0).clamp_min(0)
+        energy = eig.cumsum(0) / eig.sum().clamp_min(1e-12)
+        out[layer] = {
+            r: float(energy[min(r, len(energy)) - 1]) if r > 0 else 0.0 for r in ranks
+        }
+    return out
 
 
 @torch.no_grad()
@@ -300,26 +358,39 @@ def evaluate_predictor(
     evals: Sequence[AlignedExample],
     handoff_layers: Sequence[int] | None = None,
     mode: str = "resid",
+    capacity_ranks: Sequence[int] = (),
 ) -> StudyReport:
     """Score a predictor on held-out examples."""
     agreement = float(np.mean([ex.exact[ex.tgt.is_content].mean() for ex in evals]))
     report = StudyReport(agreement, predictor_hidden_r2(predictor, evals))
+    if capacity_ranks:
+        report.r2_bound_by_rank = capacity_bound(evals, capacity_ranks)
     if isinstance(predictor, PairMappers):
         r2 = heldout_r2(predictor, evals)
         report.src_layers = predictor.src_layers
         report.r2_keys, report.r2_values = r2["keys"], r2["values"]
     num_layers = tgt_model.config.num_hidden_layers
     for layer in handoff_layers if handoff_layers is not None else [num_layers]:
-        kls, agrees = [], []
-        for ex in evals:
+        rows = []
+        for i, ex in enumerate(evals):
             cache = translated_cache(tgt_model, predictor, ex, layer, mode)
-            kl, agree = continuation_divergence(tgt_model, ex, cache)
-            kls.append(kl)
-            agrees.append(agree)
-        native_fraction = (num_layers - layer) / num_layers
+            ref, got = continuation_logits(tgt_model, ex, cache)
+            kl, agree = divergence(ref, got)
+            alpha, run = acceptance_metrics(ref, got)
+            control = mismatched_control(ex, evals[(i + 1) % len(evals)])
+            control_cache = translated_cache(tgt_model, predictor, control, layer, mode)
+            kl_control, _ = continuation_divergence(tgt_model, ex, control_cache)
+            rows.append((float(kl), float(agree), alpha, float(run), kl_control))
+        kl, agree, alpha, run, kl_control = (float(v) for v in np.mean(rows, axis=0))
         report.handoff.append(
             HandoffResult(
-                layer, native_fraction, float(np.mean(kls)), float(np.mean(agrees))
+                handoff_layer=layer,
+                native_layer_fraction=(num_layers - layer) / num_layers,
+                kl_mean=kl,
+                top1_agreement=agree,
+                acceptance_rate=alpha,
+                greedy_run_length_mean=run,
+                kl_control_mean=kl_control,
             )
         )
     return report
@@ -350,6 +421,7 @@ def run_pair_study(
     mode: str = "resid",
     prefix_frac: float = 0.75,
     predictor: ResidualPredictor | None = None,
+    capacity_ranks: Sequence[int] = (),
 ) -> StudyReport:
     """Fit closed-form mappers on ``train_texts`` (unless a trained
     ``predictor`` is given) and score on ``eval_texts``."""
@@ -358,7 +430,9 @@ def run_pair_study(
     if predictor is None:
         train = prepare_examples(*args, train_texts, prefix_frac)
         predictor = fit_pair_mappers(train, top_k, lam)
-    return evaluate_predictor(tgt_model, predictor, evals, handoff_layers, mode)
+    return evaluate_predictor(
+        tgt_model, predictor, evals, handoff_layers, mode, capacity_ranks
+    )
 
 
 def main() -> None:
@@ -374,6 +448,9 @@ def main() -> None:
     parser.add_argument("--mode", choices=["resid", "kv"], default="resid")
     parser.add_argument("--handoff-layers", type=int, nargs="*", default=None)
     parser.add_argument("--translator", default=None, help="trained HubTranslator .pt")
+    parser.add_argument(
+        "--capacity-ranks", type=int, nargs="*", default=[512, 1024, 2048]
+    )
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -413,6 +490,7 @@ def main() -> None:
         handoff_layers=args.handoff_layers,
         mode=args.mode,
         predictor=predictor,
+        capacity_ranks=args.capacity_ranks,
     )
     print(json.dumps(asdict(report), indent=1))
 

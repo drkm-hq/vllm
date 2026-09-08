@@ -14,6 +14,7 @@ the translator can repair tokenizer-boundary mismatch from neighbours.
 Every path is a deterministic function of its inputs.
 """
 
+import weakref
 from dataclasses import asdict, dataclass, field
 
 import torch
@@ -203,24 +204,30 @@ class TranslatorPredictor:
     """Adapts a ``HubTranslator`` to the study's ``ResidualPredictor``.
 
     The translator runs once per example over all content positions; the
-    per-layer result is memoized until ``reset``.
+    result is kept for the most recent example, held through a weak
+    reference so a freed example can never alias a new one.
     """
 
     def __init__(self, translator: HubTranslator, target: str):
         self.translator = translator
         self.target = target
-        self._memo: dict[int, torch.Tensor] = {}
+        self._last: weakref.ref[AlignedExample] | None = None
+        self._pred: torch.Tensor | None = None
+
+    def preset(self, ex: AlignedExample, pred: torch.Tensor) -> None:
+        """Use an already computed prediction (e.g. one carrying gradients)."""
+        self._last, self._pred = weakref.ref(ex), pred
 
     def predict_all(self, ex: AlignedExample) -> torch.Tensor:
         """``[num_content, num_layers, d_tgt]``."""
-        key = id(ex)
-        if key not in self._memo:
+        if self._pred is None or self._last is None or self._last() is not ex:
             feats = ex.source_features(self.translator.config.src_layers)
-            self._memo[key] = self.translator(feats, self.target)
-        return self._memo[key]
+            self.preset(ex, self.translator(feats, self.target))
+        assert self._pred is not None
+        return self._pred
 
     def predict_hidden(self, ex: AlignedExample, layer: int) -> torch.Tensor:
         return self.predict_all(ex)[:, layer]
 
     def reset(self) -> None:
-        self._memo.clear()
+        self._last, self._pred = None, None

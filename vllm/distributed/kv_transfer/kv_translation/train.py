@@ -47,6 +47,7 @@ class TrainConfig:
     kl_every: int = 1
     handoff_layer: int | None = None
     log_every: int = 50
+    train_hub: bool = True
 
 
 def residual_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -65,13 +66,18 @@ def freeze(model) -> None:
 
 
 def calibrate(
-    translator: HubTranslator, target: str, examples: Sequence[AlignedExample]
+    translator: HubTranslator,
+    target: str,
+    examples: Sequence[AlignedExample],
+    hub_frozen: bool = False,
 ) -> None:
-    """Set input scales and output statistics from data before training."""
-    layers = translator.config.src_layers
-    translator.calibrate_source(
-        torch.cat([ex.source_features(layers) for ex in examples])
-    )
+    """Set output statistics for ``target`` and, unless the hub is frozen,
+    the shared input scales. A frozen hub is never touched by onboarding."""
+    if not hub_frozen:
+        layers = translator.config.src_layers
+        translator.calibrate_source(
+            torch.cat([ex.source_features(layers) for ex in examples])
+        )
     translator.heads[target].calibrate(
         torch.cat([ex.target_residuals() for ex in examples])
     )
@@ -88,16 +94,21 @@ def train_translator(
     """Optimize ``translator`` on a stream of aligned examples.
 
     ``tgt_model`` is needed only for the distillation term; it is frozen.
-    Returns a log of losses and, when ``eval_examples`` is given, held-out
-    residual R2 at every ``log_every`` steps.
+    With ``cfg.train_hub`` off only the target's own heads are optimized,
+    so onboarding a target leaves every other target's translation
+    bit-identical. Returns a log of losses and, when ``eval_examples`` is
+    given, held-out residual R2 at every ``log_every`` steps.
     """
     torch.manual_seed(cfg.seed)
     if tgt_model is not None:
         freeze(tgt_model)
     stream: Iterator[AlignedExample] = iter(examples)
-    opt = torch.optim.AdamW(
-        translator.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+    params = (
+        list(translator.parameters())
+        if cfg.train_hub
+        else list(translator.heads[target].parameters())
     )
+    opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     log: list[dict[str, float]] = []
     for step in range(cfg.steps):
         ex = next(stream)
@@ -109,7 +120,7 @@ def train_translator(
             if tgt_model is None:
                 raise ValueError("kl_weight > 0 needs tgt_model")
             predictor = TranslatorPredictor(translator, target)
-            predictor._memo[id(ex)] = pred
+            predictor.preset(ex, pred)
             handoff = cfg.handoff_layer
             if handoff is None:
                 handoff = tgt_model.config.num_hidden_layers
@@ -120,7 +131,7 @@ def train_translator(
             entry["top1_agreement"] = agree.item()
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(translator.parameters(), cfg.grad_clip)
+        torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
         opt.step()
         entry["loss"] = loss.item()
         if eval_examples is not None and (step + 1) % cfg.log_every == 0:
@@ -154,8 +165,8 @@ def main() -> None:
     parser.add_argument("--texts", required=True, help="file with one text per line")
     parser.add_argument("--out", required=True, help="where to save the translator")
     parser.add_argument("--src-layers", type=int, nargs="+", default=None)
-    parser.add_argument("--latent-dim", type=int, default=None)
-    parser.add_argument("--head-rank", type=int, default=None)
+    parser.add_argument("--latent-dim", type=int, default=2048)
+    parser.add_argument("--head-rank", type=int, default=512)
     parser.add_argument("--context-layers", type=int, default=1)
     parser.add_argument("--context-heads", type=int, default=32)
     parser.add_argument("--steps", type=int, default=2000)
@@ -186,7 +197,9 @@ def main() -> None:
     eval_texts, train_texts = texts[:n_eval], texts[n_eval:]
 
     num_src = src_model.config.num_hidden_layers
-    src_layers = tuple(args.src_layers or (2, num_src // 2, num_src - 3, num_src))
+    src_layers = tuple(
+        args.src_layers or torch.linspace(1, num_src, 6).round().int().tolist()
+    )
     tgt_layers, tgt_dim = (
         tgt_model.config.num_hidden_layers,
         tgt_model.config.hidden_size,
@@ -194,7 +207,7 @@ def main() -> None:
     config = HubConfig(
         src_layers=src_layers,
         src_dim=src_model.config.hidden_size,
-        latent_dim=args.latent_dim or tgt_dim,
+        latent_dim=args.latent_dim,
         targets={args.tgt: (tgt_layers, tgt_dim)},
         head_rank=args.head_rank,
         context_layers=args.context_layers,

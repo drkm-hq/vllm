@@ -97,12 +97,12 @@ def test_flops_scale_with_context(context_layers):
     assert (long > short) == (context_layers > 0)
 
 
-def test_predictor_memoizes_per_example(tiny_qwen3, unigram_tokenizer, corpus):
+def test_predictor_caches_per_example_without_aliasing(
+    tiny_qwen3, unigram_tokenizer, corpus
+):
     from vllm.distributed.kv_transfer.kv_translation.data import prepare_example
 
-    ex = prepare_example(
-        tiny_qwen3, unigram_tokenizer, tiny_qwen3, unigram_tokenizer, corpus[0]
-    )
+    args = (tiny_qwen3, unigram_tokenizer, tiny_qwen3, unigram_tokenizer)
     dim = tiny_qwen3.config.hidden_size
     config = HubConfig(
         src_layers=(1, 2),
@@ -111,10 +111,14 @@ def test_predictor_memoizes_per_example(tiny_qwen3, unigram_tokenizer, corpus):
         targets={"q": (tiny_qwen3.config.num_hidden_layers, dim)},
     )
     predictor = TranslatorPredictor(make(config), "q")
+    ex = prepare_example(*args, corpus[0])
     h1 = predictor.predict_hidden(ex, 1)
     assert h1.shape == (int(ex.content.sum()), dim)
-    assert predictor.predict_hidden(ex, 1) is predictor.predict_all(ex)[
-        :, 1
-    ] or torch.equal(predictor.predict_hidden(ex, 1), h1)
+    assert predictor.predict_all(ex) is predictor.predict_all(ex)
+    # A fresh example of a different length must never see a stale result.
+    for text in corpus[1:6]:
+        other = prepare_example(*args, text)
+        assert predictor.predict_all(other).shape[0] == int(other.content.sum())
+        del other
     predictor.reset()
-    assert not predictor._memo
+    assert predictor._pred is None
