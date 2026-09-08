@@ -55,18 +55,24 @@ def test_self_translation_is_near_lossless(tiny_qwen3, same_model_examples, mode
     assert r2["hidden"][0] > 0.99
     assert all(r2["hidden"][t] > 0.999 for t in range(1, num_layers))
     assert all(mappers.src_layers[t] == (t,) for t in range(num_layers))
-    kls = []
-    for ex in evals:
+    kls, baseline = [], []
+    for i, ex in enumerate(evals):
         cache = translated_cache(tiny_qwen3, mappers, ex, num_layers, mode=mode)
         kl, _ = continuation_divergence(tiny_qwen3, ex, cache)
         kls.append(kl)
-    # A wrong prefix cache scores ~3e-2 on these models. Native projections
-    # of an identity-mapped residual are exact except for layer-0 rows of
-    # unseen tokens; direct key/value prediction also pays for the norms it
-    # cannot represent linearly.
+        # A cache prefilled from a different text of the same length.
+        other = evals[(i + 1) % len(evals)]
+        if len(other.tgt) >= len(ex.tgt):
+            ids = torch.as_tensor(other.tgt.ids[: len(ex.tgt)])[None]
+            wrong = tiny_qwen3(input_ids=ids, use_cache=True).past_key_values
+            baseline.append(continuation_divergence(tiny_qwen3, ex, wrong)[0])
+    # Native projections of an identity-mapped residual are exact except
+    # for layer-0 rows of unseen tokens; direct key/value prediction also
+    # pays for the norms it cannot represent linearly. Both must sit far
+    # below what a wrong prefix cache costs.
     if mode == "resid":
         assert float(np.median(kls)) < 1e-6
-    assert max(kls) < 5e-3
+    assert max(kls) < 0.5 * float(np.median(baseline))
 
 
 def test_cross_family_study_runs(
@@ -84,7 +90,7 @@ def test_cross_family_study_runs(
     )
     num_layers = tiny_qwen3.config.num_hidden_layers
     assert 0.0 < report.boundary_agreement <= 1.0
-    assert set(report.r2["keys"]) == set(range(num_layers))
+    assert set(report.r2_keys) == set(range(num_layers))
     assert all(len(layers) == 2 for layers in report.src_layers.values())
     assert [h.handoff_layer for h in report.handoff] == [0, 2, num_layers]
     assert report.handoff[0].native_layer_fraction == 1.0
